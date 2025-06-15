@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import logging
 from io import BytesIO
 from fuzzywuzzy import fuzz
+import openpyxl.utils
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -61,7 +62,8 @@ class AISpecProcessor:
             'detail_stitching': ('H', 16),
             'reg_stitching': ('H', 17),
             'hardware': ('H', 18),
-            'other': ('H', 19)
+            'other': ('H', 19),
+            'notes': ('B', 27)  # default, may be overwritten by _refresh_template_mapping
         }
         
     def load_bom(self, bom_file: BytesIO) -> bool:
@@ -117,25 +119,33 @@ class AISpecProcessor:
             # Combine all material text for AI analysis
             combined_text = f"Upper materials: {upper_text}\nSole materials: {sole_text}"
             
+            # Build category section dynamically from template keys
+            cat_lines = []
+            key_to_label = {
+                'upper': 'Upper: Main upper materials',
+                'trim': 'Trim: Decorative elements, laces, bindings',
+                'lining': 'Lining: Interior lining',
+                'sock_topcover': 'Sock (topcover): Footbed / sock liner',
+                'sock_label': 'Sock Label: Sock labels or prints',
+                'insole': 'Insole: Insole materials',
+                'midsole': 'Midsole: Midsole materials',
+                'outsole': 'Outsole: Outsole / bottom',
+                'outsole_treatment': 'Outsole Treatment: Special outsole treatments',
+                'detail_stitching': 'Detail Stitching: Decorative stitching',
+                'reg_stitching': 'Reg Stitching: Regular stitching',
+                'hardware': 'Hardware: Buckles, eyelets, metal components',
+                'other': 'Other: Anything that does not fit above'
+            }
+            for k in self.template_mapping.keys():
+                if k in key_to_label:
+                    cat_lines.append(f"- {key_to_label[k]}")
+            categories_block = "\n".join(cat_lines)
+
             prompt = f"""You are a footwear material categorization expert. Parse these vendor material descriptions and categorize them into the correct spec sheet fields.
 
-VENDOR MATERIALS:
-{combined_text}
+VENDOR MATERIALS:\n{combined_text}
 
-SPEC SHEET CATEGORIES:
-- Upper: Main upper materials
-- Trim: Decorative elements, laces, bindings
-- Lining: Interior lining materials  
-- Sock (topcover): Footbed/sock liner materials
-- Sock Label: Sock labels or sock printing
-- Insole: Insole materials
-- Midsole: Midsole materials
-- Outsole: Outsole/bottom materials
-- Outsole Treatment: Special outsole treatments
-- Detail Stitching: Decorative or contrast stitching
-- Reg Stitching: Regular/standard stitching
-- Hardware: Buckles, eyelets, metal components
-- Other: Anything that doesn't fit above categories
+SPEC SHEET CATEGORIES:\n{categories_block}
 
 VENDOR TERMINOLOGY VARIATIONS:
 - "Ball stitching", "Small stitching" → Detail Stitching or Reg Stitching
@@ -311,12 +321,15 @@ Return ONLY valid JSON with ALL information categorized:
         best_ratio = 0
         
         for bom_material in self.materials:
-            ratio = fuzz.ratio(material_lower, bom_material.lower()) / 100.0
+            ratio = fuzz.token_set_ratio(material_lower, bom_material.lower()) / 100.0
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_match = bom_material
         
-        if best_ratio >= 0.90:
+        # Require at least one token overlap to prevent random matches like "camel berber"
+        token_overlap = bool(set(re.findall(r"[a-z0-9']+", material_lower)) & set(re.findall(r"[a-z0-9']+", best_match.lower()))) if best_match else False
+
+        if best_match and best_ratio >= 0.90 and token_overlap:
             logger.info(f"Found high-confidence fuzzy match ({best_ratio:.2f}): {best_match}")
             return MaterialMatch(
                 original=raw_material,
@@ -389,15 +402,21 @@ Return ONLY valid JSON:
             result = json.loads(result_text)
             
             if result.get('best_match') and result.get('confidence', 0) >= 0.90:
-                match = MaterialMatch(
-                    original=material,
-                    standardized=result['best_match'],
-                    confidence=result['confidence'],
-                    method='ai',
-                    reasoning=result.get('reasoning')
-                )
-                self.ai_cache[material] = match
-                return match
+                # Verify token overlap to avoid unrelated matches
+                src_tokens = set(re.findall(r"[a-z0-9']+", material.lower()))
+                match_tokens = set(re.findall(r"[a-z0-9']+", result['best_match'].lower()))
+                if src_tokens & match_tokens:
+                    match = MaterialMatch(
+                        original=material,
+                        standardized=result['best_match'],
+                        confidence=result['confidence'],
+                        method='ai',
+                        reasoning=result.get('reasoning')
+                    )
+                    self.ai_cache[material] = match
+                    return match
+                else:
+                    logger.info(f"AI suggested match '{result['best_match']}' rejected due to no token overlap with '{material}'")
             
         except Exception as e:
             logger.warning(f"AI BOM matching error for '{material}': {e}")
@@ -437,6 +456,103 @@ Return ONLY the color name (one or two words max):"""
             logger.warning(f"Color inference error: {e}")
             return "Natural"
     
+    def validate_materials(self, upper_text: str, sole_text: str, parsed_dict: Dict[str, str], model: str = "gpt-4.1-mini") -> Dict[str, str]:
+        """Run an additional AI validation pass to ensure nothing is omitted and everything is categorized correctly.
+
+        The validator compares the original vendor text with the initially-parsed dictionary and returns a corrected
+        dictionary that:
+        1. Preserves every piece of information found in the vendor text.
+        2. Moves any uncategorized items into the appropriate category or into "Other".
+        3. Never removes or alters existing information unless it is clearly duplicated.
+        """
+        try:
+            combined_text = f"Upper materials: {upper_text}\nSole materials: {sole_text}"
+            draft_json = json.dumps(parsed_dict, ensure_ascii=False)
+
+            prompt = f"""You are validating a footwear materials parsing task. Below is the ORIGINAL vendor text followed by an INITIAL JSON categorization.  
+If ANY detail from the vendor text is missing from the JSON or is in the wrong category, produce a corrected JSON with ALL details captured.  
+If you are unsure where something belongs, put it in \"Other\" as \"Label: material description\".  
+NEVER delete or shorten descriptions.  
+Return ONLY valid JSON with the exact same keys that were provided.
+
+ORIGINAL VENDOR TEXT:
+{combined_text}
+
+INITIAL JSON:
+{draft_json}
+"""
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=800
+            )
+            result_text = response.choices[0].message.content.strip()
+            if result_text.startswith('```json'):
+                result_text = result_text.replace('```json', '').replace('```', '').strip()
+            corrected = json.loads(result_text)
+            # Fallback to initial dict if something went wrong
+            if isinstance(corrected, dict):
+                return {k: v for k, v in corrected.items() if v and str(v).strip()}
+        except Exception as e:
+            logger.warning(f"Validation AI error: {e}")
+        return parsed_dict
+    
+    def _post_process_materials(self, parsed: Dict[str, str]) -> Dict[str, str]:
+        """Heuristic fixes after AI + validation parsing to catch stitching/notes issues"""
+        adjusted = parsed.copy()
+        # Move any 'stitch' phrases out of generic categories into stitching buckets
+        for key in list(adjusted.keys()):
+            val = adjusted[key]
+            low = val.lower()
+            # simple note detection
+            if re.search(r"\b(advise|measure|please|ensure|inform|confirm|provide)\b", low):
+                adjusted.setdefault('notes', '')
+                adjusted['notes'] += (('; ' if adjusted['notes'] else '') + val)
+                del adjusted[key]
+                continue
+            if 'stitch' in low:
+                # Decide detail vs reg
+                target_key = 'detail_stitching' if 'detail' in low or 'cross' in low or 'ball' in low else 'reg_stitching'
+                if target_key not in adjusted or not adjusted[target_key]:
+                    adjusted[target_key] = val
+                    del adjusted[key]
+        # remove duplicates across categories (except other/notes)
+        seen = set()
+        for k in list(adjusted.keys()):
+            v = adjusted[k]
+            if v in seen and k not in ('other', 'notes'):
+                del adjusted[k]
+            else:
+                seen.add(v)
+        return adjusted
+    
+    def _qa_review(self, original_text: str, parsed_dict: Dict[str, str], model: str = "gpt-4.1-mini") -> Dict[str, str]:
+        """Ask LLM to list any substrings missing from parsed_dict; append them to Other."""
+        try:
+            prompt = f"""Compare the ORIGINAL vendor text with the JSON below.  Return JSON with two arrays: missing (any phrase that does not appear in the JSON values) and ok if nothing is missing.
+
+ORIGINAL:\n{original_text}
+JSON:\n{json.dumps(parsed_dict, ensure_ascii=False)}"""
+            resp = self.client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200,
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(resp.choices[0].message.content)
+            missing = data.get('missing', []) if isinstance(data, dict) else []
+            if missing:
+                other_val = parsed_dict.get('Other', '')
+                for m in missing:
+                    other_val += (('; ' if other_val else '') + m)
+                parsed_dict['Other'] = other_val
+            return parsed_dict
+        except Exception as e:
+            logger.warning(f"QA review failed: {e}")
+            return parsed_dict
+    
     def process_spec_sheets(self, dev_log_file: BytesIO, template_file: BytesIO, model: str = "gpt-4.1-mini") -> ProcessingResult:
         """Main processing function with comprehensive fixes based on user feedback"""
         try:
@@ -460,6 +576,8 @@ Return ONLY the color name (one or two words max):"""
             wb_master = load_workbook(template_file)
             base_sheet = wb_master.active
             
+            self._refresh_template_mapping(base_sheet)
+            
             stats = {
                 'exact_matches': 0, 'fuzzy_matches': 0, 'ai_matches': 0, 'no_matches': 0
             }
@@ -481,19 +599,39 @@ Return ONLY the color name (one or two words max):"""
                     gender = str(row.get('Gender', ''))
                     sheet['B1'] = f"{season}, {gender}".strip(', ')
                     
-                    factory_ref = str(row.get('Factory ref #', ''))
-                    if factory_ref and 'nan' not in factory_ref.lower():
-                        sheet['B5'] = factory_ref
+                    # Improved factory reference retrieval (case-insensitive, flexible column names)
+                    factory_ref_columns = [c for c in dev.columns if 'factory' in str(c).lower() and 'ref' in str(c).lower()]
+                    factory_ref_val = ''
+                    for fr_col in factory_ref_columns:
+                        val = str(row.get(fr_col, ''))
+                        if val and 'nan' not in val.lower():
+                            factory_ref_val = val
+                            break
+                    if factory_ref_val:
+                        sheet['B5'] = factory_ref_val
                     
-                    sample_no = str(row.get('Sample Order No.', ''))
-                    if sample_no and 'nan' not in sample_no.lower():
-                        sheet['B26'] = sample_no
+                    # Sample number (flexible lookup)
+                    sample_no_cols = [c for c in dev.columns if 'sample' in str(c).lower() and ('order' in str(c).lower() or 'number' in str(c).lower())]
+                    sample_no_val = ''
+                    for sn_col in sample_no_cols:
+                        val = str(row.get(sn_col, ''))
+                        if val and 'nan' not in val.lower():
+                            sample_no_val = val
+                            break
+                    if sample_no_val:
+                        sheet['B26'] = sample_no_val
                         
                     # --- Comprehensive Material Parsing ---
                     upper_text = str(row.get('Upper', ''))
                     sole_text = str(row.get('Sole (ref # only)', '') or str(row.get('Sole', '')))
                     
                     parsed_materials = self.parse_vendor_materials(upper_text, sole_text, model=model)
+                    # NEW – run validation pass to ensure nothing omitted
+                    parsed_materials = self.validate_materials(upper_text, sole_text, parsed_materials, model=model)
+                    # Heuristic post-processing
+                    parsed_materials = self._post_process_materials(parsed_materials)
+                    # QA completeness review
+                    parsed_materials = self._qa_review(f"Upper: {upper_text}\nSole: {sole_text}", parsed_materials, model=model)
                     logger.info(f"Parsed materials for {sample_name}: {parsed_materials}")
                     
                     # --- Infer Color ---
@@ -589,4 +727,63 @@ Return ONLY the color name (one or two words max):"""
             
         except Exception as e:
             logger.error(f"Top-level processing failed: {e}", exc_info=True)
-            return ProcessingResult(success=False, samples_processed=0, total_samples=0, matches_by_method={}, errors=[str(e)]) 
+            return ProcessingResult(success=False, samples_processed=0, total_samples=0, matches_by_method={}, errors=[str(e)])
+
+    def _refresh_template_mapping(self, sheet: Worksheet):
+        """Scan the template sheet at runtime and update self.template_mapping based on placeholder text.
+        This makes the pipeline resilient to future template edits without needing code changes."""
+        try:
+            dynamic_map = {}
+            for row in range(1, 30):
+                for col in [2, 8, 12]:  # B, H, L columns likely to contain placeholders
+                    cell_val = str(sheet.cell(row=row, column=col).value or '').lower()
+                    if not cell_val:
+                        continue
+                    # Simple keyword→category heuristics
+                    key = None
+                    if 'upper' in cell_val:
+                        key = 'upper'
+                    elif 'trim' in cell_val:
+                        key = 'trim'
+                    elif 'lining' in cell_val and 'sock' not in cell_val:
+                        key = 'lining'
+                    elif 'sock' in cell_val and 'label' in cell_val:
+                        key = 'sock_label'
+                    elif 'sock' in cell_val:
+                        key = 'sock_topcover'
+                    elif 'insole' in cell_val:
+                        key = 'insole'
+                    elif 'midsole' in cell_val:
+                        key = 'midsole'
+                    elif 'outsole treatment' in cell_val or 'outsole_treatment' in cell_val:
+                        key = 'outsole_treatment'
+                    elif 'outsole' in cell_val:
+                        key = 'outsole'
+                    elif 'detail stitch' in cell_val or 'detail_stitch' in cell_val:
+                        key = 'detail_stitching'
+                    elif 'reg stitch' in cell_val or 'regular stitch' in cell_val:
+                        key = 'reg_stitching'
+                    elif 'hardware' in cell_val:
+                        key = 'hardware'
+                    elif 'other' in cell_val:
+                        key = 'other'
+                    elif 'note' in cell_val:
+                        key = 'notes'
+                    # metadata fields
+                    elif 'season' in cell_val and 'gender' in cell_val:
+                        key = 'season_gender'
+                    elif 'sample name' in cell_val:
+                        key = 'sample_name'
+                    elif 'factory ref' in cell_val:
+                        key = 'factory_ref'
+                    elif 'sample number' in cell_val or 'sample no' in cell_val:
+                        key = 'sample_number'
+                    elif 'color' in cell_val and 'name' in cell_val:
+                        key = 'color_name'
+                    if key:
+                        dynamic_map[key] = (openpyxl.utils.get_column_letter(col), row)
+            # Merge with existing map – fallback to defaults if not discovered
+            self.template_mapping.update(dynamic_map)
+            logger.info(f"Template mapping auto-refreshed: {self.template_mapping}")
+        except Exception as e:
+            logger.warning(f"Template mapping refresh failed, using defaults: {e}") 
