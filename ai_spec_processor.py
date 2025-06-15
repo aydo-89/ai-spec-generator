@@ -10,6 +10,7 @@ import openai
 from dataclasses import dataclass
 import logging
 from io import BytesIO
+from fuzzywuzzy import fuzz
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +21,7 @@ class MaterialMatch:
     original: str
     standardized: str
     confidence: float
-    method: str  # 'exact', 'fuzzy', 'ai'
+    method: str  # 'exact', 'fuzzy', 'ai', 'no_match'
     reasoning: Optional[str] = None
 
 @dataclass
@@ -39,6 +40,7 @@ class AISpecProcessor:
         self.ai_cache = {}  # Cache AI results to avoid repeated API calls
         self.materials = []
         self.exact_lookup = {}
+        self.material_codes = {}  # Maps codes to full descriptions
         
         # Template field mappings based on analysis
         self.template_mapping = {
@@ -63,42 +65,53 @@ class AISpecProcessor:
         }
         
     def load_bom(self, bom_file: BytesIO) -> bool:
-        """Load and process the BOM file"""
+        """Load and process the BOM file with proper material extraction"""
         try:
             logger.info("Loading BOM file...")
             raw_bom = pd.read_excel(bom_file)
+            logger.info(f"BOM shape: {raw_bom.shape}")
+            logger.info(f"BOM columns: {list(raw_bom.columns)}")
             
-            # Extract materials from BOM structure (category: material format)
             materials = []
+            material_codes = {}
+            
+            # Extract all non-null string values from BOM
             for idx, row in raw_bom.iterrows():
                 for col_val in row:
-                    if pd.notna(col_val) and isinstance(col_val, str):
-                        # Look for "Category: Material" format
-                        if ':' in col_val and len(col_val.split(':', 1)) == 2:
-                            category, material = col_val.split(':', 1)
-                            material = material.strip()
-                            if material and len(material) > 2:
-                                materials.append(material)
-                        elif len(col_val.strip()) > 2:
-                            materials.append(col_val.strip())
+                    if pd.notna(col_val) and isinstance(col_val, str) and len(col_val.strip()) > 2:
+                        material = col_val.strip()
+                        materials.append(material)
+                        
+                        # Extract material codes (patterns like W1063, MBA2, VP-052, etc.)
+                        code_matches = re.findall(r'\b([A-Z]+\d+(?:-\d+)?)\b', material)
+                        for code in code_matches:
+                            material_codes[code] = material
+                            material_codes[code.lower()] = material
             
-            # Clean and deduplicate materials
-            self.materials = list(set([m for m in materials if len(m) > 2]))
+            # Clean and deduplicate
+            self.materials = list(set(materials))
             self.exact_lookup = {m.lower(): m for m in self.materials}
+            self.material_codes = material_codes
             
             logger.info(f"Loaded {len(self.materials)} materials from BOM")
+            logger.info(f"Extracted {len(self.material_codes)} material codes")
+            logger.info(f"Sample materials: {self.materials[:5]}")
+            logger.info(f"Sample codes: {list(self.material_codes.keys())[:10]}")
+            
             return True
             
         except Exception as e:
             logger.error(f"Error loading BOM: {e}")
             return False
     
-    def parse_vendor_materials(self, upper_text: str, sole_text: str) -> Dict[str, str]:
+    def parse_vendor_materials(self, upper_text: str, sole_text: str, model: str = "gpt-4.1-mini") -> Dict[str, str]:
         """AI-enhanced parsing of vendor material descriptions with intelligent categorization"""
         if not isinstance(upper_text, str):
             upper_text = ""
         if not isinstance(sole_text, str):
             sole_text = ""
+            
+        logger.info(f"Parsing materials - Upper: '{upper_text}', Sole: '{sole_text}'")
             
         try:
             # Combine all material text for AI analysis
@@ -131,35 +144,44 @@ VENDOR TERMINOLOGY VARIATIONS:
 - "Microfiber", "Berber" → Lining
 - Material codes like "VP-052", "W211" → Extract the material name
 
+CRITICAL REQUIREMENTS:
+1. NOTHING can be omitted - every piece of information must be categorized
+2. Preserve ALL original details and descriptions exactly as written
+3. If unsure about a category, put it in "Other" with the original label
+4. Keep material codes, numbers, colors, and descriptions intact
+5. Handle multi-part numbers like "M63 - 360" or "90 360-81343" as single units
+
 RULES:
 1. Parse colon-delimited entries (e.g., "Upper: Brown Suede")
 2. Handle vendor-specific terminology intelligently
 3. If unsure about category, put in "Other" with format "Label: Material"
-4. Extract clean material names (remove codes when possible)
-5. Never leave materials uncategorized
+4. Preserve complete descriptions: "HB2085 tan recycled faux fur" stays complete
+5. Keep color information: "Color: Brown matching upper" stays complete
+6. Maintain material codes: "VP-052, Natural, textile covered" stays complete
+7. Never leave materials uncategorized
 
-Return ONLY valid JSON:
+Return ONLY valid JSON with ALL information categorized:
 {{
-    "Upper": "material name or empty string",
-    "Trim": "material name or empty string", 
-    "Lining": "material name or empty string",
-    "Sock (topcover)": "material name or empty string",
-    "Sock Label": "material name or empty string",
-    "Insole": "material name or empty string",
-    "Midsole": "material name or empty string", 
-    "Outsole": "material name or empty string",
-    "Outsole Treatment": "material name or empty string",
-    "Detail Stitching": "material name or empty string",
-    "Reg Stitching": "material name or empty string",
-    "Hardware": "material name or empty string",
-    "Other": "Label: Material (if any uncategorized items)"
+    "Upper": "complete material description or empty string",
+    "Trim": "complete material description or empty string",
+    "Lining": "complete material description or empty string",
+    "Sock (topcover)": "complete material description or empty string",
+    "Sock Label": "complete material description or empty string",
+    "Insole": "complete material description or empty string",
+    "Midsole": "complete material description or empty string",
+    "Outsole": "complete material description or empty string",
+    "Outsole Treatment": "complete material description or empty string",
+    "Detail Stitching": "complete material description or empty string",
+    "Reg Stitching": "complete material description or empty string",
+    "Hardware": "complete material description or empty string",
+    "Other": "Label: Complete description (for any unclear items)"
 }}"""
 
             response = self.client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=500
+                max_tokens=800
             )
             
             result_text = response.choices[0].message.content.strip()
@@ -167,26 +189,35 @@ Return ONLY valid JSON:
                 result_text = result_text.replace('```json', '').replace('```', '').strip()
             
             parsed_materials = json.loads(result_text)
+            logger.info(f"AI parsed materials: {parsed_materials}")
             
             # Clean up empty values
-            return {k: v for k, v in parsed_materials.items() if v and v.strip()}
+            cleaned_materials = {k: v for k, v in parsed_materials.items() if v and v.strip()}
+            logger.info(f"Cleaned materials: {cleaned_materials}")
+            return cleaned_materials
             
         except Exception as e:
             logger.warning(f"AI parsing error: {e}")
             # Fallback to regex parsing
-            return self._regex_parse_materials(upper_text, sole_text)
+            fallback_result = self._regex_parse_materials(upper_text, sole_text)
+            logger.info(f"Fallback parsing result: {fallback_result}")
+            return fallback_result
     
     def _regex_parse_materials(self, upper_text: str, sole_text: str) -> Dict[str, str]:
         """Fallback regex parsing for vendor materials"""
         materials = {}
         
-        # Simple patterns for common formats
+        logger.info(f"Using fallback regex parsing for Upper: '{upper_text}', Sole: '{sole_text}'")
+        
+        # Enhanced patterns for common formats
         patterns = [
             (r'upper[^:]*?:\s*([^,\n]+)', 'Upper'),
             (r'lining[^:]*?:\s*([^,\n]+)', 'Lining'),
             (r'sole[^:]*?:\s*([^,\n]+)', 'Outsole'),
             (r'outsole[^:]*?:\s*([^,\n]+)', 'Outsole'),
             (r'midsole[^:]*?:\s*([^,\n]+)', 'Midsole'),
+            (r'trim[^:]*?:\s*([^,\n]+)', 'Trim'),
+            (r'hardware[^:]*?:\s*([^,\n]+)', 'Hardware'),
         ]
         
         combined_text = f"{upper_text} {sole_text}"
@@ -197,89 +228,158 @@ Return ONLY valid JSON:
                 material = match.group(1).strip()
                 if material and len(material) > 2:
                     materials[category] = material
+                    logger.info(f"Regex matched {category}: {material}")
                     break
         
         # If no patterns match, put raw materials in appropriate categories
         if not materials:
+            logger.info("No regex patterns matched, using raw categorization")
             if upper_text.strip():
-                materials['Upper'] = upper_text.strip()
+                # Try to parse comma-separated items in upper text
+                upper_parts = [part.strip() for part in upper_text.split(',') if part.strip()]
+                for i, part in enumerate(upper_parts):
+                    if i == 0:
+                        materials['Upper'] = part
+                    else:
+                        # Additional upper materials go to Other
+                        if 'Other' not in materials:
+                            materials['Other'] = f"Upper material: {part}"
+                        else:
+                            materials['Other'] += f"; Upper material: {part}"
+                logger.info(f"Raw Upper: {materials.get('Upper', '')}")
+            
             if sole_text.strip():
-                materials['Outsole'] = sole_text.strip()
+                # Try to parse comma-separated items in sole text
+                sole_parts = [part.strip() for part in sole_text.split(',') if part.strip()]
+                for i, part in enumerate(sole_parts):
+                    if i == 0:
+                        materials['Outsole'] = part
+                    else:
+                        # Additional sole materials go to Other
+                        if 'Other' not in materials:
+                            materials['Other'] = f"Sole material: {part}"
+                        else:
+                            materials['Other'] += f"; Sole material: {part}"
+                logger.info(f"Raw Outsole: {materials.get('Outsole', '')}")
         
         return materials
     
-    def standardize_material(self, raw_material: str) -> MaterialMatch:
-        """Enhanced material standardization with BOM cross-reference"""
+    def standardize_material(self, raw_material: str, model: str = "gpt-4.1-mini") -> MaterialMatch:
+        """Enhanced material standardization with BOM cross-reference and 90% confidence threshold"""
         if not isinstance(raw_material, str) or not raw_material.strip():
-            return MaterialMatch(raw_material, raw_material, 0.0, 'no')
+            return MaterialMatch(raw_material, raw_material, 0.0, 'no_match')
         
         clean_material = raw_material.strip()
-        material_lower = clean_material.lower()
+        logger.info(f"Enhanced BOM matching for: '{clean_material}'")
         
-        # 1. Try exact match first
+        # 1. Check for exact material code matches first
+        material_codes = re.findall(r'\b([A-Z]+\d+(?:-\d+)?)\b', clean_material)
+        for code in material_codes:
+            if code in self.material_codes:
+                logger.info(f"Found exact code match: {code} -> {self.material_codes[code]}")
+                return MaterialMatch(
+                    original=raw_material,
+                    standardized=self.material_codes[code],
+                    confidence=1.0,
+                    method='exact',
+                    reasoning=f"Exact code match for {code}"
+                )
+            elif code.lower() in self.material_codes:
+                logger.info(f"Found case-insensitive code match: {code} -> {self.material_codes[code.lower()]}")
+                return MaterialMatch(
+                    original=raw_material,
+                    standardized=self.material_codes[code.lower()],
+                    confidence=1.0,
+                    method='exact',
+                    reasoning=f"Exact code match for {code}"
+                )
+        
+        # 2. Try exact string match
+        material_lower = clean_material.lower()
         if material_lower in self.exact_lookup:
+            logger.info(f"Found exact string match: {self.exact_lookup[material_lower]}")
             return MaterialMatch(
                 original=raw_material,
                 standardized=self.exact_lookup[material_lower],
                 confidence=1.0,
-                method='exact'
+                method='exact',
+                reasoning="Exact string match"
             )
         
-        # 2. Try fuzzy matching
-        fuzzy_matches = difflib.get_close_matches(
-            material_lower, list(self.exact_lookup.keys()), n=1, cutoff=0.75
-        )
-        if fuzzy_matches:
+        # 3. Try high-confidence fuzzy matching (90%+)
+        best_match = None
+        best_ratio = 0
+        
+        for bom_material in self.materials:
+            ratio = fuzz.ratio(material_lower, bom_material.lower()) / 100.0
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = bom_material
+        
+        if best_ratio >= 0.90:
+            logger.info(f"Found high-confidence fuzzy match ({best_ratio:.2f}): {best_match}")
             return MaterialMatch(
                 original=raw_material,
-                standardized=self.exact_lookup[fuzzy_matches[0]],
-                confidence=0.85,
-                method='fuzzy'
+                standardized=best_match,
+                confidence=best_ratio,
+                method='fuzzy',
+                reasoning=f"High-confidence fuzzy match ({best_ratio:.2f})"
             )
         
-        # 3. AI-enhanced matching for partial names
-        ai_result = self._ai_material_match(clean_material)
-        if ai_result:
+        # 4. Try AI-enhanced matching for partial descriptions
+        ai_result = self._ai_material_match(clean_material, model=model)
+        if ai_result and ai_result.confidence >= 0.90:
+            logger.info(f"Found AI match: {ai_result.standardized}")
             return ai_result
         
-        # 4. No match found - return original
-        return MaterialMatch(raw_material, raw_material, 0.0, 'no')
+        # 5. Conservative approach - return original if not confident
+        logger.info(f"No confident match found, returning original: {clean_material}")
+        return MaterialMatch(
+            original=raw_material,
+            standardized=raw_material,
+            confidence=0.0,
+            method='no_match',
+            reasoning="No confident match found in BOM"
+        )
     
-    def _ai_material_match(self, material: str) -> Optional[MaterialMatch]:
+    def _ai_material_match(self, material: str, model: str = "gpt-4.1-mini") -> Optional[MaterialMatch]:
         """Use AI to find the best BOM material match for partial descriptions"""
         if material in self.ai_cache:
             return self.ai_cache[material]
         
         try:
             # Create prompt with BOM materials
-            bom_list = "\n".join([f"- {mat}" for mat in self.materials[:30]])
+            bom_sample = self.materials[:50]  # Use more materials for better matching
+            bom_list = "\n".join([f"- {mat}" for mat in bom_sample])
             
-            prompt = f"""You are a footwear material matching expert. Find the best match for this vendor material description.
+            prompt = f"""You are a footwear material matching expert. Find the best match for this vendor material description from the BOM.
 
 VENDOR MATERIAL: "{material}"
 
-STANDARDIZED BOM MATERIALS:
+BOM MATERIALS (first 50):
 {bom_list}
 
 MATCHING RULES:
-- Look for partial matches (e.g., "Brown Suede" → "W1063 Minnetonka Brown Cow Suede")
-- Consider synonyms (e.g., "Pile" → "Faux Fur", "TPR" → "Rubber")
-- Match colors and material types
-- Only return exact materials from the BOM list above
-- Confidence must be 0.7+ for a valid match
+1. Look for exact code matches (e.g., "MBA2" should match "MBA2 color tan")
+2. Look for partial matches (e.g., "Brown Suede" → "W1063 Minnetonka Brown Cow Suede")
+3. Consider synonyms (e.g., "Pile" → "Faux Fur", "TPR" → "Rubber")
+4. Match colors and material types
+5. Preserve complete BOM descriptions including codes and full names
+6. Only return matches with 90%+ confidence
+7. If not 90%+ confident, return null
 
 Return ONLY valid JSON:
 {{
-    "best_match": "exact material name from BOM or null if no good match",
+    "best_match": "exact BOM material name or null if confidence < 90%",
     "confidence": 0.0-1.0,
-    "reasoning": "brief explanation of the match"
+    "reasoning": "brief explanation of the match or why no match"
 }}"""
 
             response = self.client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=200
+                max_tokens=300
             )
             
             result_text = response.choices[0].message.content.strip()
@@ -288,7 +388,7 @@ Return ONLY valid JSON:
             
             result = json.loads(result_text)
             
-            if result.get('best_match') and result.get('confidence', 0) >= 0.7:
+            if result.get('best_match') and result.get('confidence', 0) >= 0.90:
                 match = MaterialMatch(
                     original=material,
                     standardized=result['best_match'],
@@ -300,11 +400,11 @@ Return ONLY valid JSON:
                 return match
             
         except Exception as e:
-            logger.warning(f"AI matching error for '{material}': {e}")
+            logger.warning(f"AI BOM matching error for '{material}': {e}")
         
         return None
     
-    def infer_color_name(self, materials_dict: Dict[str, str]) -> str:
+    def infer_color_name(self, materials_dict: Dict[str, str], model: str = "gpt-4.1-mini") -> str:
         """AI-powered color inference from material descriptions"""
         try:
             # Combine all materials for color analysis
@@ -324,7 +424,7 @@ RULES:
 Return ONLY the color name (one or two words max):"""
 
             response = self.client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=50
@@ -337,15 +437,22 @@ Return ONLY the color name (one or two words max):"""
             logger.warning(f"Color inference error: {e}")
             return "Natural"
     
-    def process_spec_sheets(self, dev_log_file: BytesIO, template_file: BytesIO) -> ProcessingResult:
-        """Main processing function with enhanced material categorization"""
+    def process_spec_sheets(self, dev_log_file: BytesIO, template_file: BytesIO, model: str = "gpt-4.1-mini") -> ProcessingResult:
+        """Main processing function with comprehensive fixes based on user feedback"""
         try:
-            logger.info("Starting spec sheet processing...")
+            logger.info("Starting enhanced spec sheet processing...")
             
-            # Load development log
+            # Load development log with correct header handling
             dev = pd.read_excel(dev_log_file)
-            dev.columns = dev.iloc[0]  # Promote first row to header
-            dev = dev.drop(index=0).reset_index(drop=True)
+            logger.info(f"Initial development log shape: {dev.shape}")
+            logger.info(f"Initial development log columns: {list(dev.columns)}")
+            
+            # The file analysis showed the actual data starts at row 1, not row 0.
+            # Use the first row as headers if standard headers aren't present.
+            if 'Sample Name' not in dev.columns:
+                dev.columns = dev.iloc[0]
+                dev = dev.drop(index=0).reset_index(drop=True)
+                logger.info(f"Used first row as headers. New columns: {list(dev.columns)}")
             
             logger.info(f"Loaded {len(dev)} samples from development log")
             
@@ -353,78 +460,98 @@ Return ONLY the color name (one or two words max):"""
             wb_master = load_workbook(template_file)
             base_sheet = wb_master.active
             
-            # Process each sample
             stats = {
-                'exact_matches': 0,
-                'fuzzy_matches': 0,
-                'ai_matches': 0,
-                'no_matches': 0
+                'exact_matches': 0, 'fuzzy_matches': 0, 'ai_matches': 0, 'no_matches': 0
             }
-            
             errors = []
             processed_count = 0
             
             for idx, row in dev.iterrows():
                 try:
                     sample_name = str(row.get('Sample Name', f'Sample_{idx}'))
-                    logger.info(f"Processing: {sample_name}")
+                    logger.info(f"Processing sample: {sample_name}")
                     
-                    # Create new sheet
                     sheet = wb_master.copy_worksheet(base_sheet)
                     clean_name = re.sub(r'[\\/*?[\]:]+', '_', sample_name)
                     sheet.title = (clean_name[:28] + '...') if len(clean_name) > 31 else clean_name
                     
-                    # Fill basic metadata
+                    # --- Fill Metadata ---
+                    sheet['G3'] = sample_name
                     season = str(row.get('Season', ''))
                     gender = str(row.get('Gender', ''))
-                    season_gender = f"{season}, {gender}".strip(', ')
+                    sheet['B1'] = f"{season}, {gender}".strip(', ')
                     
-                    sheet['B1'] = season_gender  # Season & Gender
-                    sheet['G3'] = sample_name    # Sample Name
-                    sheet['B5'] = str(row.get('Factory ref #', ''))  # Factory Reference
-                    sheet['B26'] = str(row.get('Sample Order No.', ''))  # Sample Number
+                    factory_ref = str(row.get('Factory ref #', ''))
+                    if factory_ref and 'nan' not in factory_ref.lower():
+                        sheet['B5'] = factory_ref
                     
-                    # Parse vendor materials with AI categorization
+                    sample_no = str(row.get('Sample Order No.', ''))
+                    if sample_no and 'nan' not in sample_no.lower():
+                        sheet['B26'] = sample_no
+                        
+                    # --- Comprehensive Material Parsing ---
                     upper_text = str(row.get('Upper', ''))
-                    sole_text = str(row.get('Sole (ref # only)', '')) or str(row.get('Sole', ''))
+                    sole_text = str(row.get('Sole (ref # only)', '') or str(row.get('Sole', '')))
                     
-                    parsed_materials = self.parse_vendor_materials(upper_text, sole_text)
+                    parsed_materials = self.parse_vendor_materials(upper_text, sole_text, model=model)
+                    logger.info(f"Parsed materials for {sample_name}: {parsed_materials}")
                     
-                    # Infer color name from materials
-                    color_name = self.infer_color_name(parsed_materials)
-                    sheet['L3'] = color_name  # Color Name
+                    # --- Infer Color ---
+                    color_name = self.infer_color_name(parsed_materials, model=model)
+                    sheet['L3'] = color_name
                     
-                    # Process and standardize each material
+                    # --- Process Materials (Upper First) ---
+                    processed_materials = {}
+                    
+                    # Process Upper first to handle "matching upper" dependencies
+                    upper_material_standardized = ""
+                    if parsed_materials.get('Upper'):
+                        match_result = self.standardize_material(parsed_materials['Upper'], model=model)
+                        upper_material_standardized = match_result.standardized
+                        processed_materials['upper'] = upper_material_standardized
+                        stats[f'{match_result.method}_matches'] += 1
+                    
+                    # Process remaining materials
                     for category, raw_material in parsed_materials.items():
-                        if raw_material and raw_material.strip():
-                            # Standardize against BOM
-                            match_result = self.standardize_material(raw_material)
-                            
-                            # Update stats
-                            method_key = f'{match_result.method}_matches'
-                            if method_key in stats:
-                                stats[method_key] += 1
-                            else:
-                                stats['no_matches'] += 1
-                            
-                            # Map category to template field
-                            category_key = category.lower().replace(' ', '_').replace('(', '').replace(')', '')
-                            if category_key in self.template_mapping:
-                                col, row_num = self.template_mapping[category_key]
-                                sheet[f'{col}{row_num}'] = match_result.standardized
-                            else:
-                                # Put in "Other" category with label
-                                sheet['H19'] = f"{category}: {match_result.standardized}"
-                    
+                        category_key = category.lower().replace(' ', '_').replace('(', '').replace(')', '')
+                        if category_key == 'upper':
+                            continue
+
+                        # Handle "matching upper" substitutions
+                        if 'matching upper' in raw_material.lower() and upper_material_standardized:
+                            final_material = re.sub('matching upper', upper_material_standardized, raw_material, flags=re.IGNORECASE)
+                            logger.info(f"Substituted 'matching upper' in {category}: {final_material}")
+                        else:
+                            match_result = self.standardize_material(raw_material, model=model)
+                            final_material = match_result.standardized
+                            stats[f'{match_result.method}_matches'] += 1
+                        
+                        processed_materials[category_key] = final_material
+
+                    # --- Fill Spec Sheet ---
+                    for category_key, material_value in processed_materials.items():
+                        if category_key in self.template_mapping:
+                            col, row_num = self.template_mapping[category_key]
+                            sheet[f'{col}{row_num}'] = material_value
+                            logger.info(f"Filled {col}{row_num} ({category_key}) with: {material_value}")
+                        else:
+                            # Put uncategorized items in "Other"
+                            other_col, other_row = self.template_mapping['other']
+                            current_other = sheet[f'{other_col}{other_row}'].value or ""
+                            new_other_entry = f"{category}: {material_value}"
+                            sheet[f'{other_col}{other_row}'] = f"{current_other}; {new_other_entry}" if current_other else new_other_entry
+                            logger.info(f"Appended to Other: {new_other_entry}")
+
                     processed_count += 1
                     
                 except Exception as e:
-                    error_msg = f"Error processing {sample_name}: {str(e)}"
+                    error_msg = f"Error processing sample '{sample_name}': {str(e)}"
                     errors.append(error_msg)
-                    logger.error(error_msg)
+                    logger.error(error_msg, exc_info=True)
             
             # Remove original template sheet
-            wb_master.remove(base_sheet)
+            if base_sheet.title in wb_master.sheetnames:
+                 wb_master.remove(base_sheet)
             
             # Save to BytesIO
             output_buffer = BytesIO()
@@ -441,11 +568,5 @@ Return ONLY the color name (one or two words max):"""
             )
             
         except Exception as e:
-            logger.error(f"Processing failed: {e}")
-            return ProcessingResult(
-                success=False,
-                samples_processed=0,
-                total_samples=0,
-                matches_by_method={},
-                errors=[str(e)]
-            ) 
+            logger.error(f"Top-level processing failed: {e}", exc_info=True)
+            return ProcessingResult(success=False, samples_processed=0, total_samples=0, matches_by_method={}, errors=[str(e)]) 

@@ -73,26 +73,27 @@ st.markdown('<h1 class="main-header">👟 AI-Powered Spec Sheet Generator</h1>',
 # Sidebar
 st.sidebar.markdown("## ⚙️ Configuration")
 
-# API Key input with save functionality
-col1, col2 = st.sidebar.columns([3, 1])
+# --- API Key Input ---
+st.subheader("1. Enter Your OpenAI API Key")
+api_key_input = st.text_input(
+    "OpenAI API Key", 
+    type="password",
+    help="Your key is not stored. It is required to run the AI processing.",
+    key="api_key_input"
+)
 
-with col1:
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        value=st.session_state.saved_api_key,
-        placeholder="sk-proj-...",
-        help="Your OpenAI API key for AI-enhanced material matching"
-    )
-
-with col2:
-    st.write("")  # Add some spacing
-    if st.button("💾", help="Save API key for this session"):
-        if api_key:
-            st.session_state.saved_api_key = api_key
-            st.success("✅ Saved!")
-        else:
-            st.error("❌ Enter key first")
+# --- Model Selection ---
+st.subheader("2. Select AI Model")
+model_selection = st.selectbox(
+    "Choose the AI model for processing:",
+    ("gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"),
+    index=0,
+    help="""
+    - **gpt-4.1-mini:** Balanced model for speed and accuracy (Recommended).
+    - **gpt-4o-mini:** Faster, more affordable model, may be less accurate.
+    - **gpt-4.1:** Most powerful model, but slower and more expensive.
+    """
+)
 
 # Show saved key status and clear option
 if st.session_state.saved_api_key:
@@ -107,15 +108,15 @@ use_ai = st.sidebar.checkbox("Enable AI Enhancement", value=True, help="Use GPT-
 confidence_threshold = st.sidebar.slider("AI Confidence Threshold", 0.5, 1.0, 0.7, 0.05)
 
 # Initialize processor if API key is provided
-if api_key and not st.session_state.processor:
+if api_key_input and not st.session_state.processor:
     try:
-        st.session_state.processor = AISpecProcessor(api_key)
+        st.session_state.processor = AISpecProcessor(api_key_input)
         st.sidebar.success("✅ AI Processor initialized!")
     except Exception as e:
         st.sidebar.error(f"❌ Error initializing AI: {str(e)}")
 
 # Main content
-if not api_key:
+if not api_key_input:
     st.markdown("""
     <div class="info-box">
         <h3>🚀 Welcome to the AI Spec Sheet Generator!</h3>
@@ -330,4 +331,71 @@ st.markdown("""
     Made with ❤️ using Streamlit and OpenAI GPT-4.1 | 
     <a href="#" style="color: #1f77b4;">Need help?</a>
 </div>
-""", unsafe_allow_html=True) 
+""", unsafe_allow_html=True)
+
+# --- Processing ---
+st.subheader("4. Generate Spec Sheets")
+if st.button("Generate Spec Sheets"):
+    # Use the key from the main input, not the sidebar version
+    api_key_to_use = st.session_state.get("api_key_input", "")
+    
+    if not api_key_to_use:
+        st.error("Please enter your OpenAI API key above.")
+    elif not dev_log_file or not template_file or not bom_file:
+        st.error("Please upload all three required files.")
+    else:
+        try:
+            # Initialize processor with the provided key
+            processor = AISpecProcessor(api_key=api_key_to_use)
+            
+            with st.spinner("Loading and processing Bill of Materials (BOM)..."):
+                bom_bytes = BytesIO(bom_file.getvalue())
+                if not processor.load_bom(bom_bytes):
+                    st.error("Failed to load or process the BOM. Please check the file format and contents.")
+                    st.stop()
+
+            with st.spinner(f"AI is analyzing and generating spec sheets using `{model_selection}`... This may take a moment."):
+                dev_log_bytes = BytesIO(dev_log_file.getvalue())
+                template_bytes = BytesIO(template_file.getvalue())
+                
+                # Run processing and pass the selected model
+                result = processor.process_spec_sheets(
+                    dev_log_bytes, 
+                    template_bytes, 
+                    model=model_selection
+                )
+
+            if result.success:
+                st.success("Spec sheets generated successfully!")
+                st.balloons()
+                
+                # Display stats
+                st.write(f"**Processing Summary:**")
+                st.info(f"""
+                - **Total Samples:** {result.total_samples}
+                - **Samples Processed:** {result.samples_processed}
+                - **Exact Matches:** {result.matches_by_method.get('exact', 0)}
+                - **Fuzzy Matches:** {result.matches_by_method.get('fuzzy', 0)}
+                - **AI Matches:** {result.matches_by_method.get('ai', 0)}
+                - **No Matches:** {result.matches_by_method.get('no_match', 0)}
+                """)
+                
+                if result.errors:
+                    st.warning("Some samples encountered errors:")
+                    st.text_area("Error Log", "\n".join(result.errors), height=150)
+
+                # Download button
+                st.download_button(
+                    label="Download Generated Spec Sheets",
+                    data=result.output_file,
+                    file_name=f"Generated_Spec_Sheets_{dev_log_file.name}",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.error("An error occurred during processing.")
+                if result.errors:
+                    st.text_area("Error Log", "\n".join(result.errors), height=200)
+
+        except Exception as e:
+            st.error(f"A critical error occurred: {e}")
+            logger.error(f"Streamlit app critical error: {e}", exc_info=True) 
