@@ -64,6 +64,8 @@ if 'processing_result' not in st.session_state:
     st.session_state.processing_result = None
 if 'files_uploaded' not in st.session_state:
     st.session_state.files_uploaded = False
+if 'saved_api_key' not in st.session_state:
+    st.session_state.saved_api_key = ""
 
 # Header
 st.markdown('<h1 class="main-header">👟 AI-Powered Spec Sheet Generator</h1>', unsafe_allow_html=True)
@@ -71,13 +73,33 @@ st.markdown('<h1 class="main-header">👟 AI-Powered Spec Sheet Generator</h1>',
 # Sidebar
 st.sidebar.markdown("## ⚙️ Configuration")
 
-# API Key input
-api_key = st.sidebar.text_input(
-    "OpenAI API Key",
-    type="password",
-    placeholder="sk-proj-...",
-    help="Your OpenAI API key for AI-enhanced material matching"
-)
+# API Key input with save functionality
+col1, col2 = st.sidebar.columns([3, 1])
+
+with col1:
+    api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        value=st.session_state.saved_api_key,
+        placeholder="sk-proj-...",
+        help="Your OpenAI API key for AI-enhanced material matching"
+    )
+
+with col2:
+    st.write("")  # Add some spacing
+    if st.button("💾", help="Save API key for this session"):
+        if api_key:
+            st.session_state.saved_api_key = api_key
+            st.success("✅ Saved!")
+        else:
+            st.error("❌ Enter key first")
+
+# Show saved key status and clear option
+if st.session_state.saved_api_key:
+    st.sidebar.success("🔑 API Key saved for this session")
+    if st.sidebar.button("🗑️ Clear Saved API Key"):
+        st.session_state.saved_api_key = ""
+        st.rerun()
 
 # AI Settings
 st.sidebar.markdown("### 🤖 AI Settings")
