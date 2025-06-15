@@ -503,16 +503,24 @@ Return ONLY the color name (one or two words max):"""
                     # --- Process Materials (Upper First) ---
                     processed_materials = {}
                     
+                    # Helper function to update stats correctly
+                    def update_stats(method: str):
+                        if method == 'no_match':
+                            stats['no_matches'] += 1
+                        else:
+                            stats[f'{method}_matches'] += 1
+                    
                     # Process Upper first to handle "matching upper" dependencies
                     upper_material_standardized = ""
                     if parsed_materials.get('Upper'):
                         match_result = self.standardize_material(parsed_materials['Upper'], model=model)
                         upper_material_standardized = match_result.standardized
                         processed_materials['upper'] = upper_material_standardized
-                        stats[f'{match_result.method}_matches'] += 1
+                        update_stats(match_result.method)
                     
                     # Process remaining materials
                     for category, raw_material in parsed_materials.items():
+                        # Normalize category names to match template_mapping keys
                         category_key = category.lower().replace(' ', '_').replace('(', '').replace(')', '')
                         if category_key == 'upper':
                             continue
@@ -524,23 +532,35 @@ Return ONLY the color name (one or two words max):"""
                         else:
                             match_result = self.standardize_material(raw_material, model=model)
                             final_material = match_result.standardized
-                            stats[f'{match_result.method}_matches'] += 1
+                            update_stats(match_result.method)
                         
                         processed_materials[category_key] = final_material
 
                     # --- Fill Spec Sheet ---
                     for category_key, material_value in processed_materials.items():
-                        if category_key in self.template_mapping:
-                            col, row_num = self.template_mapping[category_key]
-                            sheet[f'{col}{row_num}'] = material_value
-                            logger.info(f"Filled {col}{row_num} ({category_key}) with: {material_value}")
-                        else:
-                            # Put uncategorized items in "Other"
-                            other_col, other_row = self.template_mapping['other']
-                            current_other = sheet[f'{other_col}{other_row}'].value or ""
-                            new_other_entry = f"{category}: {material_value}"
-                            sheet[f'{other_col}{other_row}'] = f"{current_other}; {new_other_entry}" if current_other else new_other_entry
-                            logger.info(f"Appended to Other: {new_other_entry}")
+                        try:
+                            if category_key in self.template_mapping:
+                                col, row_num = self.template_mapping[category_key]
+                                sheet[f'{col}{row_num}'] = material_value
+                                logger.info(f"Filled {col}{row_num} ({category_key}) with: {material_value}")
+                            else:
+                                # Put uncategorized items in "Other"
+                                other_col, other_row = self.template_mapping['other']
+                                current_other = sheet[f'{other_col}{other_row}'].value or ""
+                                new_other_entry = f"{category_key}: {material_value}"
+                                sheet[f'{other_col}{other_row}'] = f"{current_other}; {new_other_entry}" if current_other else new_other_entry
+                                logger.info(f"Appended to Other: {new_other_entry}")
+                        except Exception as e:
+                            logger.warning(f"Error filling spec sheet for {category_key}: {e}")
+                            # Try to put in Other as fallback
+                            try:
+                                other_col, other_row = self.template_mapping['other']
+                                current_other = sheet[f'{other_col}{other_row}'].value or ""
+                                new_other_entry = f"{category_key}: {material_value}"
+                                sheet[f'{other_col}{other_row}'] = f"{current_other}; {new_other_entry}" if current_other else new_other_entry
+                                logger.info(f"Fallback - Appended to Other: {new_other_entry}")
+                            except Exception as e2:
+                                logger.error(f"Failed to add to Other category: {e2}")
 
                     processed_count += 1
                     
