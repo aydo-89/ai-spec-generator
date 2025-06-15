@@ -40,23 +40,45 @@ class AISpecProcessor:
         self.materials = []
         self.exact_lookup = {}
         
+        # Template field mappings based on analysis
+        self.template_mapping = {
+            'season_gender': ('B', 1),
+            'sample_name': ('G', 3),
+            'color_name': ('L', 3),
+            'factory_ref': ('B', 5),
+            'sample_number': ('B', 26),
+            'upper': ('H', 6),
+            'trim': ('H', 8),
+            'lining': ('H', 9),
+            'sock_topcover': ('H', 10),
+            'sock_label': ('H', 11),
+            'insole': ('H', 12),
+            'midsole': ('H', 13),
+            'outsole': ('H', 14),
+            'outsole_treatment': ('H', 15),
+            'detail_stitching': ('H', 16),
+            'reg_stitching': ('H', 17),
+            'hardware': ('H', 18),
+            'other': ('H', 19)
+        }
+        
     def load_bom(self, bom_file: BytesIO) -> bool:
         """Load and process the BOM file"""
         try:
             logger.info("Loading BOM file...")
-            raw_bom = pd.read_excel(bom_file, header=None)
+            raw_bom = pd.read_excel(bom_file)
             
-            # Extract materials from the BOM structure
+            # Extract materials from BOM structure (category: material format)
             materials = []
             for idx, row in raw_bom.iterrows():
                 for col_val in row:
                     if pd.notna(col_val) and isinstance(col_val, str):
-                        # Look for material names (skip part names with colons)
-                        if ':' in col_val:
-                            # Split "Part: Material" format
-                            parts = col_val.split(':', 1)
-                            if len(parts) == 2 and parts[1].strip():
-                                materials.append(parts[1].strip())
+                        # Look for "Category: Material" format
+                        if ':' in col_val and len(col_val.split(':', 1)) == 2:
+                            category, material = col_val.split(':', 1)
+                            material = material.strip()
+                            if material and len(material) > 2:
+                                materials.append(material)
                         elif len(col_val.strip()) > 2:
                             materials.append(col_val.strip())
             
@@ -71,8 +93,123 @@ class AISpecProcessor:
             logger.error(f"Error loading BOM: {e}")
             return False
     
+    def parse_vendor_materials(self, upper_text: str, sole_text: str) -> Dict[str, str]:
+        """AI-enhanced parsing of vendor material descriptions with intelligent categorization"""
+        if not isinstance(upper_text, str):
+            upper_text = ""
+        if not isinstance(sole_text, str):
+            sole_text = ""
+            
+        try:
+            # Combine all material text for AI analysis
+            combined_text = f"Upper materials: {upper_text}\nSole materials: {sole_text}"
+            
+            prompt = f"""You are a footwear material categorization expert. Parse these vendor material descriptions and categorize them into the correct spec sheet fields.
+
+VENDOR MATERIALS:
+{combined_text}
+
+SPEC SHEET CATEGORIES:
+- Upper: Main upper materials
+- Trim: Decorative elements, laces, bindings
+- Lining: Interior lining materials  
+- Sock (topcover): Footbed/sock liner materials
+- Sock Label: Sock labels or sock printing
+- Insole: Insole materials
+- Midsole: Midsole materials
+- Outsole: Outsole/bottom materials
+- Outsole Treatment: Special outsole treatments
+- Detail Stitching: Decorative or contrast stitching
+- Reg Stitching: Regular/standard stitching
+- Hardware: Buckles, eyelets, metal components
+- Other: Anything that doesn't fit above categories
+
+VENDOR TERMINOLOGY VARIATIONS:
+- "Ball stitching", "Small stitching" → Detail Stitching or Reg Stitching
+- "Pile", "Faux fur" → Upper or Lining
+- "TPR", "EVA", "Rubber" → Outsole
+- "Microfiber", "Berber" → Lining
+- Material codes like "VP-052", "W211" → Extract the material name
+
+RULES:
+1. Parse colon-delimited entries (e.g., "Upper: Brown Suede")
+2. Handle vendor-specific terminology intelligently
+3. If unsure about category, put in "Other" with format "Label: Material"
+4. Extract clean material names (remove codes when possible)
+5. Never leave materials uncategorized
+
+Return ONLY valid JSON:
+{{
+    "Upper": "material name or empty string",
+    "Trim": "material name or empty string", 
+    "Lining": "material name or empty string",
+    "Sock (topcover)": "material name or empty string",
+    "Sock Label": "material name or empty string",
+    "Insole": "material name or empty string",
+    "Midsole": "material name or empty string", 
+    "Outsole": "material name or empty string",
+    "Outsole Treatment": "material name or empty string",
+    "Detail Stitching": "material name or empty string",
+    "Reg Stitching": "material name or empty string",
+    "Hardware": "material name or empty string",
+    "Other": "Label: Material (if any uncategorized items)"
+}}"""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=500
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            if result_text.startswith('```json'):
+                result_text = result_text.replace('```json', '').replace('```', '').strip()
+            
+            parsed_materials = json.loads(result_text)
+            
+            # Clean up empty values
+            return {k: v for k, v in parsed_materials.items() if v and v.strip()}
+            
+        except Exception as e:
+            logger.warning(f"AI parsing error: {e}")
+            # Fallback to regex parsing
+            return self._regex_parse_materials(upper_text, sole_text)
+    
+    def _regex_parse_materials(self, upper_text: str, sole_text: str) -> Dict[str, str]:
+        """Fallback regex parsing for vendor materials"""
+        materials = {}
+        
+        # Simple patterns for common formats
+        patterns = [
+            (r'upper[^:]*?:\s*([^,\n]+)', 'Upper'),
+            (r'lining[^:]*?:\s*([^,\n]+)', 'Lining'),
+            (r'sole[^:]*?:\s*([^,\n]+)', 'Outsole'),
+            (r'outsole[^:]*?:\s*([^,\n]+)', 'Outsole'),
+            (r'midsole[^:]*?:\s*([^,\n]+)', 'Midsole'),
+        ]
+        
+        combined_text = f"{upper_text} {sole_text}"
+        
+        for pattern, category in patterns:
+            matches = re.finditer(pattern, combined_text, re.IGNORECASE)
+            for match in matches:
+                material = match.group(1).strip()
+                if material and len(material) > 2:
+                    materials[category] = material
+                    break
+        
+        # If no patterns match, put raw materials in appropriate categories
+        if not materials:
+            if upper_text.strip():
+                materials['Upper'] = upper_text.strip()
+            if sole_text.strip():
+                materials['Outsole'] = sole_text.strip()
+        
+        return materials
+    
     def standardize_material(self, raw_material: str) -> MaterialMatch:
-        """Enhanced material standardization with AI"""
+        """Enhanced material standardization with BOM cross-reference"""
         if not isinstance(raw_material, str) or not raw_material.strip():
             return MaterialMatch(raw_material, raw_material, 0.0, 'no')
         
@@ -90,7 +227,7 @@ class AISpecProcessor:
         
         # 2. Try fuzzy matching
         fuzzy_matches = difflib.get_close_matches(
-            material_lower, list(self.exact_lookup.keys()), n=1, cutoff=0.85
+            material_lower, list(self.exact_lookup.keys()), n=1, cutoff=0.75
         )
         if fuzzy_matches:
             return MaterialMatch(
@@ -100,52 +237,52 @@ class AISpecProcessor:
                 method='fuzzy'
             )
         
-        # 3. AI-enhanced matching
+        # 3. AI-enhanced matching for partial names
         ai_result = self._ai_material_match(clean_material)
         if ai_result:
             return ai_result
         
-        # 4. No match found
+        # 4. No match found - return original
         return MaterialMatch(raw_material, raw_material, 0.0, 'no')
     
     def _ai_material_match(self, material: str) -> Optional[MaterialMatch]:
-        """Use AI to find the best material match"""
+        """Use AI to find the best BOM material match for partial descriptions"""
         if material in self.ai_cache:
             return self.ai_cache[material]
         
         try:
             # Create prompt with BOM materials
-            bom_list = "\n".join([f"- {mat}" for mat in self.materials[:50]])
+            bom_list = "\n".join([f"- {mat}" for mat in self.materials[:30]])
             
-            prompt = f"""You are a footwear material standardization expert.
+            prompt = f"""You are a footwear material matching expert. Find the best match for this vendor material description.
 
-Given this supplier material description: "{material}"
+VENDOR MATERIAL: "{material}"
 
-Find the best match from our standardized BOM materials:
+STANDARDIZED BOM MATERIALS:
 {bom_list}
+
+MATCHING RULES:
+- Look for partial matches (e.g., "Brown Suede" → "W1063 Minnetonka Brown Cow Suede")
+- Consider synonyms (e.g., "Pile" → "Faux Fur", "TPR" → "Rubber")
+- Match colors and material types
+- Only return exact materials from the BOM list above
+- Confidence must be 0.7+ for a valid match
 
 Return ONLY valid JSON:
 {{
     "best_match": "exact material name from BOM or null if no good match",
     "confidence": 0.0-1.0,
-    "reasoning": "brief explanation of why this is the best match"
-}}
-
-Requirements:
-- Only return materials that exist exactly in the BOM list above
-- Confidence should be 0.7+ for a match
-- Consider synonyms, abbreviations, and common footwear material variations
-- If no good match (confidence < 0.7), return null for best_match"""
+    "reasoning": "brief explanation of the match"
+}}"""
 
             response = self.client.chat.completions.create(
-                model="gpt-4.1-mini",  # Using mini for cost efficiency
+                model="gpt-4.1-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=200
             )
             
             result_text = response.choices[0].message.content.strip()
-            # Remove markdown formatting if present
             if result_text.startswith('```json'):
                 result_text = result_text.replace('```json', '').replace('```', '').strip()
             
@@ -167,78 +304,41 @@ Requirements:
         
         return None
     
-    def parse_material_block(self, text: str) -> Dict[str, str]:
-        """AI-enhanced parsing of complex material descriptions"""
-        if not isinstance(text, str) or not text.strip():
-            return {}
-        
+    def infer_color_name(self, materials_dict: Dict[str, str]) -> str:
+        """AI-powered color inference from material descriptions"""
         try:
-            prompt = f"""Extract shoe part materials from this text: "{text}"
+            # Combine all materials for color analysis
+            all_materials = " ".join([f"{k}: {v}" for k, v in materials_dict.items() if v])
+            
+            prompt = f"""Extract the primary color name from these footwear materials:
 
-Common shoe parts: Upper, Lining, Insole, Outsole, Midsole, Footbed, Heel, Toe, Quarter, Vamp, Sock, Topcover
+MATERIALS: {all_materials}
 
-Return ONLY valid JSON with part names as keys and materials as values:
-{{
-    "Upper": "material name",
-    "Lining": "material name",
-    "Outsole": "material name"
-}}
+RULES:
+- Return the main/primary color (e.g., "Brown", "Black", "Natural", "Cognac")
+- Look in Upper materials first, then other materials
+- For multi-color items, pick the dominant color
+- Use standard color names (not codes)
+- If no clear color, return "Natural"
 
-Rules:
-- Only include parts that are clearly mentioned
-- Clean up material names (remove extra spaces, colors, codes)
-- Use standard part names
-- Extract the core material name (e.g., "Cow Suede" not "W1063 Minnetonka Brown Cow Suede")
-- If unclear or empty, return {{}}"""
+Return ONLY the color name (one or two words max):"""
 
             response = self.client.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=300
+                max_tokens=50
             )
             
-            result_text = response.choices[0].message.content.strip()
-            if result_text.startswith('```json'):
-                result_text = result_text.replace('```json', '').replace('```', '').strip()
-            
-            return json.loads(result_text)
+            color = response.choices[0].message.content.strip().strip('"')
+            return color if color else "Natural"
             
         except Exception as e:
-            logger.warning(f"AI parsing error: {e}")
-            # Fallback to regex parsing
-            return self._regex_parse_materials(text)
-    
-    def _regex_parse_materials(self, text: str) -> Dict[str, str]:
-        """Fallback regex parsing"""
-        materials = {}
-        
-        patterns = [
-            r'(Upper[^:]*?):\s*([^-\n]+?)(?:\s*[-\n]|$)',
-            r'(Lining[^:]*?):\s*([^,\n]+?)(?:\s*[,\n]|$)',
-            r'(Sole[^:]*?):\s*([^,\n]+?)(?:\s*[,\n]|$)',
-            r'(Midsole[^:]*?):\s*([^,\n]+?)(?:\s*[,\n]|$)',
-            r'(Outsole[^:]*?):\s*([^,\n]+?)(?:\s*[,\n]|$)',
-            r'(Footbed[^:]*?):\s*([^,\n]+?)(?:\s*[,\n]|$)',
-        ]
-        
-        for pattern in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
-            for match in matches:
-                part = match.group(1).strip()
-                material = match.group(2).strip()
-                
-                # Clean up
-                part = re.sub(r'[/\s]+', ' ', part.strip())
-                material = re.split(r'[,\-]\s*(?:Color|Colour)', material)[0].strip()
-                
-                if part and material and len(material) > 2:
-                    materials[part] = material
-        
-        return materials
+            logger.warning(f"Color inference error: {e}")
+            return "Natural"
     
     def process_spec_sheets(self, dev_log_file: BytesIO, template_file: BytesIO) -> ProcessingResult:
-        """Main processing function"""
+        """Main processing function with enhanced material categorization"""
         try:
             logger.info("Starting spec sheet processing...")
             
@@ -274,34 +374,47 @@ Rules:
                     clean_name = re.sub(r'[\\/*?[\]:]+', '_', sample_name)
                     sheet.title = (clean_name[:28] + '...') if len(clean_name) > 31 else clean_name
                     
-                    # Fill metadata
-                    season_gender = f"{row.get('Season', '')}, {row.get('Gender', '')}"
-                    sheet['B1'] = season_gender
-                    sheet['C2'] = sample_name
-                    sheet['A4'] = row.get('Factory ref #', '') or row.get('Factory Ref #', '')
-                    sheet['E2'] = row.get('Sample Order No.', '')
+                    # Fill basic metadata
+                    season = str(row.get('Season', ''))
+                    gender = str(row.get('Gender', ''))
+                    season_gender = f"{season}, {gender}".strip(', ')
                     
-                    # Parse and standardize materials
-                    upper_materials = self.parse_material_block(str(row.get('Upper', '')))
+                    sheet['B1'] = season_gender  # Season & Gender
+                    sheet['G3'] = sample_name    # Sample Name
+                    sheet['B5'] = str(row.get('Factory ref #', ''))  # Factory Reference
+                    sheet['B26'] = str(row.get('Sample Order No.', ''))  # Sample Number
+                    
+                    # Parse vendor materials with AI categorization
+                    upper_text = str(row.get('Upper', ''))
                     sole_text = str(row.get('Sole (ref # only)', '')) or str(row.get('Sole', ''))
-                    sole_materials = self.parse_material_block(sole_text)
                     
-                    all_materials = {**upper_materials, **sole_materials}
+                    parsed_materials = self.parse_vendor_materials(upper_text, sole_text)
                     
-                    # Match and standardize materials
-                    for part, raw_material in all_materials.items():
-                        match_result = self.standardize_material(raw_material)
-                        # Update stats safely
-                        method_key = f'{match_result.method}_matches'
-                        if method_key in stats:
-                            stats[method_key] += 1
-                        else:
-                            stats['no_matches'] += 1
-                        
-                        # Find template row and fill
-                        template_row = self._find_template_row(sheet, part)
-                        if template_row:
-                            sheet[f'B{template_row}'] = match_result.standardized
+                    # Infer color name from materials
+                    color_name = self.infer_color_name(parsed_materials)
+                    sheet['L3'] = color_name  # Color Name
+                    
+                    # Process and standardize each material
+                    for category, raw_material in parsed_materials.items():
+                        if raw_material and raw_material.strip():
+                            # Standardize against BOM
+                            match_result = self.standardize_material(raw_material)
+                            
+                            # Update stats
+                            method_key = f'{match_result.method}_matches'
+                            if method_key in stats:
+                                stats[method_key] += 1
+                            else:
+                                stats['no_matches'] += 1
+                            
+                            # Map category to template field
+                            category_key = category.lower().replace(' ', '_').replace('(', '').replace(')', '')
+                            if category_key in self.template_mapping:
+                                col, row_num = self.template_mapping[category_key]
+                                sheet[f'{col}{row_num}'] = match_result.standardized
+                            else:
+                                # Put in "Other" category with label
+                                sheet['H19'] = f"{category}: {match_result.standardized}"
                     
                     processed_count += 1
                     
@@ -335,12 +448,4 @@ Rules:
                 total_samples=0,
                 matches_by_method={},
                 errors=[str(e)]
-            )
-    
-    def _find_template_row(self, sheet: Worksheet, part_name: str) -> Optional[int]:
-        """Find where to place a material in the template"""
-        for r in range(1, sheet.max_row + 1):
-            cell_value = sheet[f'A{r}'].value
-            if cell_value and part_name.lower() in str(cell_value).lower():
-                return r
-        return None 
+            ) 
